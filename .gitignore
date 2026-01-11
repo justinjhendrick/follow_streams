@@ -1,0 +1,4 @@
+*.swp
+*.osm.pbf
+.*_cache
+.venv

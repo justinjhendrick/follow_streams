@@ -1,0 +1,6 @@
+pyrosm==0.6.2
+matplotlib==3.10.8
+joblib==1.5.3
+
+# dev deps
+mypy==1.19.1
