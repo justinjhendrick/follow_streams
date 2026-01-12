@@ -1,3 +1,4 @@
+import math
 from copy import deepcopy
 from argparse import ArgumentParser, Namespace
 from geopandas import GeoDataFrame
@@ -40,11 +41,53 @@ def read(source: Path) -> GeoDataFrame:
     log(f"done reading from {source}")
     return result
 
+type Coord = tuple[float, float]
+
+def dist(a: Coord, b: Coord) -> float:
+    return math.sqrt((a[0] - b[0])**2 + (a[1] - b[1])**2)
+
+class Candidate:
+    def __init__(self, idx: int, coords: list[Coord]) -> None:
+        self.idx = idx
+        self.coords = coords
+
+    def dist(self, a: Coord) -> float:
+        dist_to_start = dist(a, self.coords[0])
+        dist_to_end = dist(a, self.coords[-1])
+        return min(dist_to_start, dist_to_end)
+
+    def get(self, a: Coord | None) -> list[Coord]:
+        if a is None:
+            return self.coords
+        dist_to_start = dist(a, self.coords[0])
+        dist_to_end = dist(a, self.coords[-1])
+        if dist_to_end < dist_to_start:
+            return list(reversed(self.coords))
+        else:
+            return self.coords
+
+
 def flatten(mp: shapely.MultiPolygon) -> shapely.Polygon:
-    coords = []
-    for polygon in mp.geoms:
-        coords.extend(polygon.exterior.coords)
-    return shapely.Polygon(coords)
+    DEBUG = True
+    if DEBUG:
+        result = []
+        for i, polygon in enumerate(mp.geoms):
+            result.extend(list(polygon.exterior.coords))
+        return shapely.Polygon(result)
+    else:
+        candidates = {}
+        for i, polygon in enumerate(mp.geoms):
+            candidates[i] = Candidate(i, list(polygon.exterior.coords))
+        result = []
+        start = candidates.pop(0)
+        result.extend(start.get(None))
+        while len(candidates) > 0:
+            target = result[-1]
+            closest = min(candidates.values(), key=lambda c: c.dist(target))
+            result.extend(closest.get(target))
+            log(closest.idx)
+            del candidates[closest.idx]
+    return shapely.Polygon(result)
 
 def cleanup(geo_data: GeoDataFrame) -> GeoDataFrame:
     log("start filtering geo_data")
