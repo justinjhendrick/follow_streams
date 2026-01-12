@@ -1,13 +1,16 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
 import math
 from copy import deepcopy
 from argparse import ArgumentParser, Namespace
-from geopandas import GeoDataFrame
 from joblib import Memory
 from matplotlib.axes import Axes
 from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
 from matplotlib.figure import Figure
 from pathlib import Path
-from pyrosm import OSM
+from pyrosm.pbfreader import parse_osm_data
+from pyrosm.data_manager import get_osm_data
 from time import monotonic as now
 from typing import Any
 import json
@@ -25,106 +28,76 @@ def log(x: Any) -> None:
 
 def handle_args() -> Namespace:
     ap = ArgumentParser()
-    ap.add_argument("-s", "--source", help="Path to source data (*.osm.pbf)", type=Path)
-    ap.add_argument("-d", "--dest", help="Path to destination file (*.png)", type=Path)
+    ap.add_argument("-s", "--source", required=True, help="Path to source data (*.osm.pbf)", type=Path)
+    ap.add_argument("-d", "--dest", required=True, help="Path to destination file (*.png)", type=Path)
     return ap.parse_args()
-    
-@memory.cache
-def read(source: Path) -> GeoDataFrame:
-    log(f"start reading from {source}")
-    osm = OSM(str(source))
-    result = osm.get_natural(
-        custom_filter={
-            "natural": ["water"],
-        },
-    )
-    log(f"done reading from {source}")
-    return result
 
 type Coord = tuple[float, float]
+type Tags = dict[str, str]
 
-def dist(a: Coord, b: Coord) -> float:
-    return math.sqrt((a[0] - b[0])**2 + (a[1] - b[1])**2)
+@dataclass
+class Way:
+    ident: int
+    tags: Tags
+    coords: list[Coord]
 
-class Candidate:
-    def __init__(self, idx: int, coords: list[Coord]) -> None:
-        self.idx = idx
-        self.coords = coords
+@dataclass
+class Relation:
+    ident: int
+    tags: Tags
+    way_ids: list[int]  # actually ndarray thing?
 
-    def dist(self, a: Coord) -> float:
-        dist_to_start = dist(a, self.coords[0])
-        dist_to_end = dist(a, self.coords[-1])
-        return min(dist_to_start, dist_to_end)
+type Ways = dict[int, Way]
+type Relations = dict[int, Relation]
 
-    def get(self, a: Coord | None) -> list[Coord]:
-        if a is None:
-            return self.coords
-        dist_to_start = dist(a, self.coords[0])
-        dist_to_end = dist(a, self.coords[-1])
-        if dist_to_end < dist_to_start:
-            return list(reversed(self.coords))
-        else:
-            return self.coords
+# @memory.cache
+def read(source: Path) -> tuple[Ways, Relations]:
+    log(f"start reading from {source}")
+    _nodes, ways, relations, node_coords_lookup = parse_osm_data(str(source), None, False, None)
+    ways = pd.DataFrame(ways)
+    relations = pd.DataFrame(relations)
 
+    my_relations = {}
+    for idx, relation in relations.iterrows():
+        tags = relation["tags"]
+        if tags.get("natural") != "water":
+            continue
+        if tags.get("name") != "Lake Sammamish":
+            continue
+        way_ids = relation["members"]["member_id"]
+        r = Relation(relation["id"], tags, way_ids)
+        my_relations[r.ident] = r
 
-def flatten(mp: shapely.MultiPolygon) -> shapely.Polygon:
-    DEBUG = True
-    if DEBUG:
-        result = []
-        for i, polygon in enumerate(mp.geoms):
-            result.extend(list(polygon.exterior.coords))
-        return shapely.Polygon(result)
-    else:
-        candidates = {}
-        for i, polygon in enumerate(mp.geoms):
-            candidates[i] = Candidate(i, list(polygon.exterior.coords))
-        result = []
-        start = candidates.pop(0)
-        result.extend(start.get(None))
-        while len(candidates) > 0:
-            target = result[-1]
-            closest = min(candidates.values(), key=lambda c: c.dist(target))
-            result.extend(closest.get(target))
-            log(closest.idx)
-            del candidates[closest.idx]
-    return shapely.Polygon(result)
+    my_ways = {}
+    for idx, way in ways.iterrows():
+        ident = way["id"]
+        tags = relation["tags"]
+        # if tags.get("natural") != "water" and not any(ident in r.way_ids for r in relations):
+        if not any(ident in r.way_ids for r in relations):
+            continue
+        coords = []
+        for node_ident in way["nodes"]:
+            node = node_coords_lookup[node_ident]
+            coords.append((node["lat"], node["lon"]))
+        w = Way(ident, tags, coords)
+        my_ways[w.ident] = w
 
-def cleanup(geo_data: GeoDataFrame) -> GeoDataFrame:
-    log("start filtering geo_data")
-    keep = []
-    for idx, row in geo_data.iterrows():
-        tags = json.loads(row["tags"])
-        name = tags.get("name")
-        geo = row["geometry"]
-        water_type = row["water"]
-        if name is not None and "Samm" in name:
-            log(f"{name=} has {shapely.get_num_coordinates(geo)} points")
-            new_row = deepcopy(row)
-            if isinstance(geo, shapely.MultiPolygon):
-                new_row["geometry"] = flatten(geo)
-            keep.append(new_row)
-    log("done filtering geo_data")
-    return GeoDataFrame(keep, crs=geo_data.crs)
+    return my_ways, my_relations
 
-def render(geo_data: GeoDataFrame, dest: Path) -> None:
+def render(ways: Ways, relations: Relations, dest: Path) -> None:
     log("start render")
     fig = Figure()
     ax = fig.add_subplot()
-    for idx, row in geo_data.iterrows():
-        print(row)
-    geo_data.plot(ax=ax)
+    # TODO
     canvas = FigureCanvas(fig)
     assert not dest.is_dir()
     assert dest.suffix == ".png"
     canvas.print_png(dest)
-    log("done render")
-
 
 def main() -> None:
     args = handle_args()
-    geo_data = read(args.source)
-    geo_data = cleanup(geo_data)
-    render(geo_data, args.dest)
+    ways, relations = read(args.source)
+    render(ways, relations, args.dest)
 
 if __name__ == "__main__":
     main()
