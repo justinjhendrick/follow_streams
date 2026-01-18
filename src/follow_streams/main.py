@@ -1,19 +1,18 @@
 from __future__ import annotations
 
+import multiprocessing as mp
 import queue
 from argparse import ArgumentParser, Namespace
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from pathlib import Path
 from time import monotonic as now
 from typing import Any
-from collections import defaultdict
-from concurrent.futures import ProcessPoolExecutor
 
 import osmium
 import osmium.filter
 import osmium.osm
 from geopandas import GeoDataFrame
 from matplotlib.backends.backend_agg import FigureCanvasAgg
-from matplotlib.backends.backend_svg import FigureCanvasSVG
 from matplotlib.figure import Figure
 
 start = now()
@@ -41,20 +40,20 @@ def read(source: Path) -> GeoDataFrame:
         .with_filter(
             osmium.filter.TagFilter(
                 ("natural", "water"),
-                # ("natural", "strait"),
-                # ("natural", "bay"),
+                ("natural", "strait"),
+                ("natural", "bay"),
                 ("water", "lake"),
-                ("water", "oxbow"),
+                # ("water", "oxbow"),
                 ("water", "river"),
                 ("water", "stream"),
-                ("water", "pond"),
+                # ("water", "pond"),
                 ("water", "reservoir"),
                 ("waterway", "stream"),
                 ("waterway", "river"),
                 ("waterway", "tidal_channel"),
                 ("waterway", "canal"),
-                ("waterway", "ditch"),
-                ("waterway", "drain"),
+                # ("waterway", "ditch"),
+                # ("waterway", "drain"),
             )
         )
         .with_filter(osmium.filter.GeoInterfaceFilter(tags=["name"]))
@@ -62,61 +61,60 @@ def read(source: Path) -> GeoDataFrame:
     return GeoDataFrame.from_features(fp, crs="EPSG:4326")
 
 
-class Graph:
-    def __init__(self) -> None:
-        self.edges: dict[int, list[int]] = defaultdict(list)
+# depends on fork!
+g_frontier = mp.Queue()
+g_gdf: None | GeoDataFrame = None
 
-    def add(self, a: int, b: int) -> None:
-        self._add(a, b)
-        self._add(b, a)
 
-    def _add(self, a: int, b: int) -> None:
-        self.edges[a].append(b)
-
-    def neighbors(self, a: int) -> list[int]:
-        return self.edges[a]
-
-def intersects(idx_a, a, gdf):
-    bs = []
-    for idx_b, b in gdf.iterrows():
-        if a.intersects(b["geometry"]):
-            bs.append(idx_b)
-    return idx_a, bs
+def find_neighbors(start_idx: Any) -> None:
+    global g_frontier
+    global g_gdf
+    assert g_gdf is not None
+    start_geo = g_gdf.loc[start_idx]["geometry"]
+    is_touching = g_gdf["geometry"].intersects(start_geo)
+    for idx in g_gdf[is_touching].index:
+        g_frontier.put_nowait(idx)
 
 
 def reachability_filter(gdf: GeoDataFrame) -> GeoDataFrame:
+    global g_gdf
+
+    # Quick filter based on rectangle that puget sound watershed is in
+    centroids = gdf["geometry"].centroid
+    close_enough = (centroids.x < -120.6) & (centroids.y > 46.5)
+    gdf = gdf[close_enough]
     print(gdf)
-    graph = Graph()
-    frontier = queue.SimpleQueue()
-    futures = []
-    with ProcessPoolExecutor(max_workers=16) as pool:
-        for idx_a, a in gdf.iterrows():
-            a_name = a["name"]
-            if a_name == "Lake Washington":
-                frontier.put_nowait(idx_a)
-            futures.append(pool.submit(intersects, idx_a, a["geometry"], gdf.iloc[(idx_a + 1):]))
 
-        total = len(futures)
-        for idx, future in enumerate(futures):
-            print(f"{idx} / {total}")
-            idx_a, idx_bs = future.result()
-            for idx_b in idx_bs:
-                graph.add(idx_a, idx_b)
-
+    # Expensive filter by graph reachability
+    puget_sound_idx = gdf[gdf["name"] == "Puget Sound"].index[0]
+    g_frontier.put_nowait(puget_sound_idx)
     reached = set()
-    while frontier.qsize() > 0:
-        node = frontier.get_nowait()
-        if node in reached:
-            print(len(reached))
-            continue
-        reached.add(node)
-        for neighbor in graph.neighbors(node):
-            frontier.put_nowait(neighbor)
+    iters = 0
+    in_prog_futures = set()
+    g_gdf = gdf
+    assert mp.get_start_method() == "fork"
+    with ProcessPoolExecutor() as pool:
+        while g_frontier.qsize() > 0 or len(in_prog_futures) > 0:
+            if iters % 1000 == 0:
+                log(f"{iters=}, frontier={g_frontier.qsize()}, reached={len(reached)}")
+            iters += 1
 
-    result = gdf.iloc[list(reached)]
-    print(result)
-    return result
+            try:
+                node = g_frontier.get(timeout=0.1)
+            except queue.Empty:
+                # if there's no work to do for this process. Wait for a result from another process.
+                done_futures, in_prog_futures = wait(in_prog_futures, return_when=FIRST_COMPLETED)
+                for f in done_futures:
+                    f.result()  # raise exceptions
+                continue
+            if node in reached:
+                continue
+            reached.add(node)
+            in_prog_futures.add(pool.submit(find_neighbors, node))
+    gdf = gdf.loc[list(reached)]
+    print(gdf)
 
+    return gdf
 
 
 def render(gdf: GeoDataFrame, dest: Path) -> None:
