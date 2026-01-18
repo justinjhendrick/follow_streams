@@ -30,6 +30,27 @@ def handle_args() -> Namespace:
     return ap.parse_args()
 
 
+class DropIntermittentFilter:
+    def __init__(self) -> None:
+        self.node = self._should_drop
+        self.way = self._should_drop
+        self.relation = self._should_drop
+
+    def _should_drop(self, v: Any) -> bool:
+        # A filter is a handler that returns a boolean in the handler
+        # functions indicating if the object should pass the filter (False)
+        # or be dropped (True).
+        return v.tags.get("intermittent") == "yes"
+
+
+class DropIdFilter:
+    def __init__(self, ident: int) -> None:
+        self._ident = ident
+
+    def way(self, v: Any) -> bool:
+        return v.id == self._ident
+
+
 def read(source: Path) -> GeoDataFrame:
     log("start read")
     fp = (
@@ -56,6 +77,8 @@ def read(source: Path) -> GeoDataFrame:
                 # ("waterway", "drain"),
             )
         )
+        .with_filter(DropIntermittentFilter())
+        .with_filter(DropIdFilter(631469130))  # Stream goes uphill here! 47.02694289590613, -122.93298280193007
         .with_filter(osmium.filter.GeoInterfaceFilter(tags=["name"]))
     )
     return GeoDataFrame.from_features(fp, crs="EPSG:4326")
@@ -119,24 +142,28 @@ def reachability_filter(gdf: GeoDataFrame) -> GeoDataFrame:
 
 def render(gdf: GeoDataFrame, dest: Path) -> None:
     log("start render")
-    kms = 600
-    meters = kms * 1000
-    pixels_per_meter = 0.01
-    size_px = meters * pixels_per_meter
+    width_px = 2000
     dpi = 100
-    size_in = size_px / dpi
-    fig = Figure(figsize=(size_in, size_in), dpi=dpi)
+    width_inch = width_px / dpi
+    height_inch = 1.2 * width_inch
+    fig = Figure(figsize=(width_inch, height_inch), dpi=dpi, layout="constrained")
     ax = fig.add_subplot()
     gdf.plot(ax=ax, linewidth=1)
+    ax.set_axis_off()
     assert not dest.is_dir()
-    # FigureCanvasSVG(fig).print_svg(dest)
     FigureCanvasAgg(fig).print_png(dest)
 
 
 def main() -> None:
     args = handle_args()
-    gdf = read(args.source)
-    gdf = reachability_filter(gdf)
+    here = Path(__file__).resolve().parent
+    cache_dir = here / ".gdf_cache"
+    if cache_dir.exists():
+        gdf = GeoDataFrame.from_file(cache_dir)
+    else:
+        gdf = read(args.source)
+        gdf = reachability_filter(gdf)
+        gdf.to_file(cache_dir)
     render(gdf, args.dest)
     log("done")
 
